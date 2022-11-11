@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"fmt"
 	plutoversionsfile "github.com/fairwindsops/pluto/v5"
 	"github.com/fairwindsops/pluto/v5/pkg/api"
 	"github.com/fairwindsops/pluto/v5/pkg/finder"
@@ -16,17 +15,21 @@ var (
 	apiInstance *api.Instance
 )
 
+const (
+	workDirPath string = "/tmp/workdir"
+)
+
 // Cluster as defined in argocd-apps repo
 type Cluster struct {
-	Autosync          bool     `yaml:"autosync,omitempty"`
-	Chart             string   `yaml:"chart,omitempty"`
-	ChartVersion      string   `yaml:"chartVersion,omitempty"`
-	GitRepo           string   `yaml:"gitRepo,omitempty"`
-	HelmRepo          string   `yaml:"helmRepo,omitempty"`
-	IgnoreDifferences []string `yaml:"ignoreDifferences,omitempty"`
-	Name              string   `yaml:"name,omitempty"`
-	SyncOptions       []string `yaml:"syncOptions,omitempty"`
-	ValuesFiles       []string `yaml:"valuesFiles,omitempty"`
+	Autosync          bool        `yaml:"autosync,omitempty"`
+	Chart             string      `yaml:"chart,omitempty"`
+	ChartVersion      string      `yaml:"chartVersion,omitempty"`
+	GitRepo           string      `yaml:"gitRepo,omitempty"`
+	HelmRepo          string      `yaml:"helmRepo,omitempty"`
+	IgnoreDifferences interface{} `yaml:"ignoreDifferences,omitempty"`
+	Name              string      `yaml:"name,omitempty"`
+	SyncOptions       []string    `yaml:"syncOptions,omitempty"`
+	ValuesFiles       []string    `yaml:"valuesFiles,omitempty"`
 }
 
 type Zone struct {
@@ -46,7 +49,7 @@ func parseArgocdAppsFile(filepath string) ArgoCdApps {
 	// read the file
 	data, err := os.ReadFile(filepath)
 	if err != nil {
-		log.Fatal(err)
+		log.Printf("Error Reading %s due to %s", filepath, err)
 	}
 
 	// make the struct
@@ -55,7 +58,7 @@ func parseArgocdAppsFile(filepath string) ArgoCdApps {
 	// parse the read file into the struct
 	err = yaml.Unmarshal(data, &argocdApps)
 	if err != nil {
-		log.Fatal(err)
+		log.Printf("Error Unmarshalling due to %s", err)
 	}
 
 	return argocdApps
@@ -81,58 +84,117 @@ func initialiseApiInstance() {
 	return
 }
 
-// templateChart  templates the given `chart` with the given `valuesFiles` and `version`
-// if version not specified the latest version will be templated
-// if valuesFiles not present, only values.yaml if present will be used the values file
-// helm template [chart]  [-f valuesFiles[0] ...] [--version version]
-func templateChart(chart string, valuesFiles []string, version string) ([]byte, error) {
+// fetchChart will do a `helm fetch chart`  --version <version> --untar -d workDirPath
+func fetchChart(repo string, chart string, version string) (string, error) {
 
-	// helmArgs is used to store all arguments that we need to pass to helm command
-	var helmArgs []string
-	helmArgs = append(helmArgs, "template")
-	helmArgs = append(helmArgs, chart)
-
-	// if values file is present add [-f valuesFiles[0] ...]
-	for _, file := range valuesFiles {
-		helmArgs = append(helmArgs, "-f", file)
-	}
+	// helmFetchArgs is used to store all arguments that we need to pass to helm command for
+	var helmFetchArgs []string
+	helmFetchArgs = append(helmFetchArgs, "fetch")
+	helmFetchArgs = append(helmFetchArgs, repo+"/"+chart)
 
 	// if version is set use that particular version.
 	// not setting version with template the latest chart
 	if len(version) > 0 {
-		helmArgs = append(helmArgs, "--version", version)
+		helmFetchArgs = append(helmFetchArgs, "--version", version)
+	}
+
+	helmFetchArgs = append(helmFetchArgs, "--untar")
+	helmFetchArgs = append(helmFetchArgs, "-d", workDirPath)
+
+	// prepare the command
+	helmFetchCmd := exec.Command("helm", helmFetchArgs...)
+
+	// prepare the output buffer for the command
+	var helmFetchOutput bytes.Buffer
+	helmFetchCmd.Stdout = &helmFetchOutput
+
+	// remove the path before running
+	err := os.RemoveAll(workDirPath + "/" + chart)
+	if err != nil {
+		log.Printf("Unable to remove %s due to %s", workDirPath+"/"+chart, err)
+		return "", err
+	}
+
+	// run the command
+	err = helmFetchCmd.Run()
+	log.Println(helmFetchCmd.String())
+	if err != nil {
+		log.Printf("%s : %s", helmFetchCmd.String(), err)
+		return "", err
+	}
+
+	return workDirPath + "/" + chart, nil
+}
+
+// templateChart  templates the fetch given `chart` from `repo` with the given `valuesFiles` and `version`
+// if version not specified the latest version will be templated
+// if valuesFiles not present, only values.yaml if present will be used the values file
+// helm template [chart]  [-f valuesFiles[0] ...] [--version version]
+func templateChart(repo string, chart string, valuesFiles []string, version string) ([]byte, error) {
+
+	path, err := fetchChart(repo, chart, version)
+	if err != nil {
+		return nil, err
+	}
+
+	// helmTemplateArgs is used to store all arguments that we need to pass to helm command
+	var helmTemplateArgs []string
+	helmTemplateArgs = append(helmTemplateArgs, "template")
+	helmTemplateArgs = append(helmTemplateArgs, path)
+
+	// if values file is present add [-f valuesFiles[0] ...]
+	for _, file := range valuesFiles {
+		helmTemplateArgs = append(helmTemplateArgs, "-f", path+"/"+file)
 	}
 
 	// prepare the command
-	helmTemplateCmd := exec.Command("helm", helmArgs...)
+	helmTemplateCmd := exec.Command("helm", helmTemplateArgs...)
 
 	// prepare the output buffer for the command
 	var helmTemplateOutput bytes.Buffer
 	helmTemplateCmd.Stdout = &helmTemplateOutput
 
 	// run the command
-	err := helmTemplateCmd.Run()
+	err = helmTemplateCmd.Run()
+	log.Println(helmTemplateCmd.String())
 	if err != nil {
-		log.Fatal(err)
+		log.Printf("Error Templating: %s : due to %s", helmTemplateCmd.String(), err)
 	}
 
 	// return the output
 	return helmTemplateOutput.Bytes(), nil
 }
 
+const (
+	PASS    = 1
+	FAILED  = 0
+	UNKNOWN = 3
+)
+
+func processCluster(cluster Cluster) int {
+	if len(cluster.Chart) > 0 {
+		dir := finder.Dir{
+			Instance: apiInstance,
+		}
+		data, _ := templateChart("chartrepo", cluster.Chart, cluster.ValuesFiles, cluster.ChartVersion)
+		dir.Instance.Outputs, _ = dir.Instance.IsVersioned(data)
+		dir.Instance.FilterOutput()
+		log.Println(dir.Instance.Outputs)
+		return dir.Instance.GetReturnCode()
+	}
+	return UNKNOWN
+
+}
+
 func main() {
 
-	parseArgocdAppsFile("./tests/argocd-apps-test.yaml")
-
 	initialiseApiInstance()
-	// dir is finder dirlication
-	dir := finder.Dir{
-		Instance: apiInstance,
+	argocd := parseArgocdAppsFile("/Users/siddharth.y/workspace/src/github.com/sedflix/argocd-apps-depreciation-detector/tests/argocd-apps-test.yaml")
+	for _, zone := range argocd.Zones {
+		log.Print(zone.Alias)
+		for name, cluster := range zone.Clusters {
+			log.Println(name)
+			log.Println(processCluster(cluster))
+		}
 	}
-
-	data, _ := templateChart("chartrepo/apollo", []string{}, "")
-
-	dir.Instance.Outputs, _ = dir.Instance.IsVersioned(data)
-	dir.Instance.FilterOutput()
-	fmt.Println(dir.Instance.Outputs)
 }
