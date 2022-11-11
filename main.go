@@ -160,6 +160,7 @@ func templateChart(repo string, chart string, valuesFiles []string, version stri
 	log.Println(helmTemplateCmd.String())
 	if err != nil {
 		log.Printf("Error Templating: %s : due to %s", helmTemplateCmd.String(), err)
+		return nil, err
 	}
 
 	// return the output
