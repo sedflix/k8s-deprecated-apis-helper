@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"strings"
 )
 
 var (
@@ -94,7 +95,7 @@ func fetchChart(repo string, chart string, version string) (string, error) {
 
 	// if version is set use that particular version.
 	// not setting version with template the latest chart
-	if len(version) > 0 {
+	if len(version) > 0 && !strings.Contains(version, "*") && !strings.Contains(version, "~") && !strings.Contains(version, "^") && !strings.Contains(version, "-") {
 		helmFetchArgs = append(helmFetchArgs, "--version", version)
 	}
 
@@ -166,9 +167,9 @@ func templateChart(repo string, chart string, valuesFiles []string, version stri
 }
 
 const (
-	PASS    = 1
 	FAILED  = 0
-	UNKNOWN = 3
+	PASS    = 1
+	UNKNOWN = 2
 )
 
 func processCluster(cluster Cluster) int {
@@ -176,25 +177,51 @@ func processCluster(cluster Cluster) int {
 		dir := finder.Dir{
 			Instance: apiInstance,
 		}
-		data, _ := templateChart("chartrepo", cluster.Chart, cluster.ValuesFiles, cluster.ChartVersion)
-		dir.Instance.Outputs, _ = dir.Instance.IsVersioned(data)
+		data, err := templateChart("chartrepo", cluster.Chart, cluster.ValuesFiles, cluster.ChartVersion)
+		if err != nil {
+			return UNKNOWN
+		}
+		dir.Instance.Outputs, err = dir.Instance.IsVersioned(data)
+		if err != nil {
+			return UNKNOWN
+		}
+
 		dir.Instance.FilterOutput()
 		log.Println(dir.Instance.Outputs)
-		return dir.Instance.GetReturnCode()
+		if dir.Instance.GetReturnCode() == 3 {
+			// 3 implies removed apis are included
+			// 2 implies deprecated apis are included
+			return FAILED
+		}
+		return PASS
 	}
 	return UNKNOWN
-
 }
+
+var state2string = map[int]string{0: "Failed", 1: "Passed", 2: "Unknown"}
 
 func main() {
 
 	initialiseApiInstance()
 	argocd := parseArgocdAppsFile("/Users/siddharth.y/workspace/src/github.com/sedflix/argocd-apps-depreciation-detector/tests/argocd-apps-test.yaml")
-	for _, zone := range argocd.Zones {
-		log.Print(zone.Alias)
+	output := make(map[string]string)
+	for zoneName, zone := range argocd.Zones {
+		log.Printf("zone: %s", zoneName)
 		for name, cluster := range zone.Clusters {
-			log.Println(name)
-			log.Println(processCluster(cluster))
+			log.Printf("starting cluster %s", name)
+			clusterstate := processCluster(cluster)
+			output[name] = state2string[clusterstate]
+			log.Printf("finished cluster %s with state %s", name, output[name])
 		}
+	}
+
+	// write output to a file
+	d, err := yaml.Marshal(&output)
+	if err != nil {
+		log.Fatalf("error: %v", err)
+	}
+	err = os.WriteFile("stage.yaml", d, 0644)
+	if err != nil {
+		log.Fatalf("error: %v", err)
 	}
 }
