@@ -18,7 +18,18 @@ var (
 
 const (
 	workDirPath string = "/tmp/workdir"
+	FAILED      int    = 0
+	PASS        int    = 1
+	UNKNOWN     int    = 2
 )
+
+const ()
+
+var state2string = map[int]string{
+	0: "Failed",
+	1: "Passed",
+	2: "Unknown",
+}
 
 // Cluster as defined in argocd-apps repo
 type Cluster struct {
@@ -167,12 +178,6 @@ func templateChart(repo string, chart string, valuesFiles []string, version stri
 	return helmTemplateOutput.Bytes(), nil
 }
 
-const (
-	FAILED  = 0
-	PASS    = 1
-	UNKNOWN = 2
-)
-
 func processCluster(cluster Cluster) int {
 	if len(cluster.Chart) > 0 {
 		dir := finder.Dir{
@@ -199,9 +204,9 @@ func processCluster(cluster Cluster) int {
 	return UNKNOWN
 }
 
-var state2string = map[int]string{0: "Failed", 1: "Passed", 2: "Unknown"}
-
 func main() {
+
+	_ = os.MkdirAll(workDirPath, 0644)
 
 	initialiseApiInstance()
 	argocd := parseArgocdAppsFile("/Users/siddharth.y/workspace/src/github.com/sedflix/argocd-apps-depreciation-detector/tests/argocd-apps-test.yaml")
