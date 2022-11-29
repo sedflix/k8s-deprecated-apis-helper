@@ -120,6 +120,10 @@ func fetchChart(repo string, chart string, version string) (string, error) {
 	var helmFetchOutput bytes.Buffer
 	helmFetchCmd.Stdout = &helmFetchOutput
 
+	// prepare the output buffer for the command for storing the error output
+	var helmFetchOutputErr bytes.Buffer
+	helmFetchCmd.Stderr = &helmFetchOutputErr
+
 	// remove the path before running
 	err := os.RemoveAll(workDirPath + "/" + chart)
 	if err != nil {
@@ -128,10 +132,11 @@ func fetchChart(repo string, chart string, version string) (string, error) {
 	}
 
 	// run the command
-	err = helmFetchCmd.Run()
 	log.Println(helmFetchCmd.String())
+	err = helmFetchCmd.Run()
+
 	if err != nil {
-		log.Printf("%s : %s", helmFetchCmd.String(), err)
+		log.Printf("Helm Fetch %s  failed due to %s", helmFetchCmd.String(), helmFetchOutputErr.String())
 		return "", err
 	}
 
@@ -162,15 +167,19 @@ func templateChart(repo string, chart string, valuesFiles []string, version stri
 	// prepare the command
 	helmTemplateCmd := exec.Command("helm", helmTemplateArgs...)
 
-	// prepare the output buffer for the command
+	// prepare the output buffer for the command. this buffer will store the templated chart
 	var helmTemplateOutput bytes.Buffer
 	helmTemplateCmd.Stdout = &helmTemplateOutput
 
+	// prepare the output buffer for the command error message. used for printing the templating error reason.
+	var helmTemplateOutputErr bytes.Buffer
+	helmTemplateCmd.Stderr = &helmTemplateOutputErr
+
 	// run the command
-	err = helmTemplateCmd.Run()
 	log.Println(helmTemplateCmd.String())
+	err = helmTemplateCmd.Run()
 	if err != nil {
-		log.Printf("Error Templating: %s : due to %s", helmTemplateCmd.String(), err)
+		log.Printf("Error Templating: %s : due to %s", helmTemplateCmd.String(), helmTemplateOutputErr.String())
 		return nil, err
 	}
 
@@ -178,45 +187,60 @@ func templateChart(repo string, chart string, valuesFiles []string, version stri
 	return helmTemplateOutput.Bytes(), nil
 }
 
-func processCluster(cluster Cluster) int {
+// returns all the crds
+func findCRDs(dir finder.Dir) (b []string) {
+	var crds []string
+
+	for _, output := range dir.Instance.Outputs {
+		if output.APIVersion.Kind == "CustomResourceDefinition" {
+			crds = append(crds, output.Name)
+		}
+	}
+	return crds
+}
+
+func processCluster(cluster Cluster) (int, []string) {
 	if len(cluster.Chart) > 0 {
 		dir := finder.Dir{
 			Instance: apiInstance,
 		}
-		data, err := templateChart("chartrepo", cluster.Chart, cluster.ValuesFiles, cluster.ChartVersion)
+		data, err := templateChart("jf", cluster.Chart, cluster.ValuesFiles, cluster.ChartVersion)
 		if err != nil {
-			return UNKNOWN
+			return UNKNOWN, nil
 		}
 		dir.Instance.Outputs, err = dir.Instance.IsVersioned(data)
 		if err != nil {
-			return UNKNOWN
+			return UNKNOWN, nil
 		}
 
 		dir.Instance.FilterOutput()
 		log.Println(dir.Instance.Outputs)
-		if dir.Instance.GetReturnCode() == 3 {
+		crds := findCRDs(dir)
+		if len(crds) > 0 {
 			// 3 implies removed apis are included
 			// 2 implies deprecated apis are included
-			return FAILED
+			return FAILED, crds
 		}
-		return PASS
+		return PASS, nil
 	}
-	return UNKNOWN
+	return UNKNOWN, nil
 }
 
 func main() {
 
-	_ = os.MkdirAll(workDirPath, 0644)
+	_ = os.MkdirAll(workDirPath, 0775)
 
 	initialiseApiInstance()
 	argocd := parseArgocdAppsFile("/Users/siddharth.y/workspace/src/github.com/sedflix/argocd-apps-depreciation-detector/tests/argocd-apps-test.yaml")
-	output := make(map[string]string)
+	output := make(map[string][]string)
 	for zoneName, zone := range argocd.Zones {
 		log.Printf("zone: %s", zoneName)
 		for name, cluster := range zone.Clusters {
 			log.Printf("starting cluster %s", name)
-			clusterstate := processCluster(cluster)
-			output[name] = state2string[clusterstate]
+			clusterstate, crds := processCluster(cluster)
+			if clusterstate == FAILED {
+				output[name] = crds
+			}
 			log.Printf("finished cluster %s with state %s", name, output[name])
 		}
 	}
@@ -226,7 +250,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("error: %v", err)
 	}
-	err = os.WriteFile("stage.yaml", d, 0644)
+	err = os.WriteFile("uat-nonpci.yaml", d, 0775)
 	if err != nil {
 		log.Fatalf("error: %v", err)
 	}
